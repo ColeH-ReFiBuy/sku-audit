@@ -1,0 +1,7 @@
+greenlet==3.2.5
+numpy==2.0.2
+opencv-python-headless==4.13.0.92
+pillow==11.3.0
+playwright==1.59.0
+pyee==13.0.1
+typing_extensions==4.15.0
