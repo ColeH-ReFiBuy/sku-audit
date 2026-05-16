@@ -503,6 +503,244 @@ def _click_first_chatgpt_product(page: Page, sku: str) -> bool:
     return False
 
 
+def capture_alexa(product_title: str, sku: str,
+                  profile_dir: Path = DEFAULT_PROFILE,
+                  port: int = CDP_PORT) -> list[Path]:
+    """Capture Shopping with Alexa (formerly Rufus) contextual prompt
+    pills for a product. Flow:
+
+      1. Search amazon.com/s?k=<product_title>.
+      2. Click the first organic (non-sponsored) result to land on a PDP.
+      3. Open the Alexa side panel (#nav-rufus-disco).
+      4. Wait for the contextual-pills section to render
+         (`.rufus-html-turn-contextual-pills`).
+      5. Inject CSS to pin the panel as a full-height left rail.
+      6. Take TWO viewport screenshots:
+           - alexa_top.png: scrolled to top (panel + product card +
+             inline 'Ask a question' pills)
+           - alexa_specific.png: scrolled to the 'Looking for specific
+             info?' section (panel + the deeper pill set)
+         Each is a readable viewport snap, not a 27000px stitched mess.
+
+    Returns a list of saved screenshot paths (may be 0-2 entries).
+
+    NOTE: DOM is still rufus-prefixed (`#nav-rufus-disco`,
+    `#nav-flyout-rufus`, `.rufus-html-turn-contextual-pills`, etc.)
+    even though Amazon's brand for it is now "Shopping with Alexa".
+    Requires sign-in — anonymous sessions don't get the panel/pills.
+    """
+    out_dir = ROOT / "samples" / sku
+    out_dir.mkdir(parents=True, exist_ok=True)
+    top_path = out_dir / "alexa_top.png"
+    specific_path = out_dir / "alexa_specific.png"
+    saved: list[Path] = []
+
+    print(f"\n[Alexa]")
+    print(f"Query:    {product_title!r}")
+    print(f"Outputs:  {top_path.name}, {specific_path.name}")
+
+    launch_chrome_if_needed(profile_dir, port)
+
+    with sync_playwright() as p:
+        browser: Browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        ctx = browser.contexts[0]
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        try:
+            # 1. Search results page
+            search_url = "https://www.amazon.com/s?" + urlencode({"k": product_title})
+            print(f"Searching: {search_url}")
+            page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(3)
+
+            # 2. Find first organic result
+            print("Finding first organic search result...")
+            href = page.evaluate("""
+                () => {
+                  const results = document.querySelectorAll('div[data-component-type="s-search-result"]');
+                  for (const r of results) {
+                    // Skip sponsored — Amazon marks them in a few ways
+                    const sponsored = r.querySelector(
+                      'span.puis-sponsored-label-text, span.s-sponsored-info-icon, ' +
+                      '[data-component-type="sp-sponsored-result"], ' +
+                      'a[aria-label*="Sponsored" i]'
+                    ) || /sponsored/i.test(r.getAttribute('data-component-type') || '');
+                    if (sponsored) continue;
+                    // Prefer a /dp/ link inside the title
+                    const a = r.querySelector('h2 a[href*="/dp/"]') ||
+                              r.querySelector('a[href*="/dp/"]');
+                    if (a && a.href) return a.href;
+                  }
+                  // Fallback: any /dp/ link on the page
+                  const fb = document.querySelector('a[href*="/dp/"]');
+                  return fb ? fb.href : null;
+                }
+            """)
+            if not href:
+                print("WARN: no product result found on search page.",
+                      file=sys.stderr)
+                # Dump candidates for debugging
+                debug_dir = ROOT / "output" / sku
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                cand = page.evaluate("""
+                    () => Array.from(document.querySelectorAll('a[href*="/dp/"]'))
+                      .slice(0, 30)
+                      .map(a => ({href: a.href.slice(0, 160), text: (a.textContent || '').trim().slice(0, 80)}))
+                """)
+                with open(debug_dir / "alexa_search_candidates.txt", "w") as f:
+                    for c in cand:
+                        f.write(f'{c["href"]}  text="{c["text"]}"\n')
+                page.screenshot(path=str(out_dir / "alexa_no_result.png"),
+                                full_page=False)
+                return saved
+
+            print(f"  first result: {href[:120]}")
+
+            # 3. Navigate to the PDP
+            page.goto(href, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception:
+                pass
+            time.sleep(5)
+            print(f"  landed at {page.url[:120]}")
+
+            # 4. Make sure the Alexa panel is open. The DOM keeps the
+            # panel present at all times — it just toggles visibility +
+            # opacity in CSS — so a bounding-rect check is a FALSE
+            # POSITIVE. Inspect computed style instead.
+            panel_open = page.evaluate("""
+                () => {
+                  const p = document.querySelector('#nav-flyout-rufus, .rufus-panel-container');
+                  if (!p) return false;
+                  const cs = getComputedStyle(p);
+                  return cs.visibility !== 'hidden' &&
+                         parseFloat(cs.opacity || '1') > 0.5;
+                }
+            """)
+            print(f"  panel open? {panel_open}")
+            if not panel_open:
+                try:
+                    page.click('#nav-rufus-disco', timeout=5000)
+                    print("  clicked #nav-rufus-disco to open panel")
+                    time.sleep(3)
+                except Exception as e:
+                    print(f"  failed to open panel: {e}", file=sys.stderr)
+
+            # 5. Wait for contextual pills. Amazon streams them in after
+            # the panel opens on a PDP. They live in
+            # `.rufus-html-turn-contextual-pills` inside the panel.
+            print("Waiting for contextual prompt pills...")
+            try:
+                page.wait_for_selector(
+                    '.rufus-html-turn-contextual-pills',
+                    state='attached', timeout=20000,
+                )
+                time.sleep(4)  # let pills finish fading in
+                print("  pills attached")
+            except Exception:
+                print("  pills didn't appear within 20s — screenshotting anyway",
+                      file=sys.stderr)
+
+            # 6. Force the Alexa panel into a full-viewport-height left
+            # rail. Amazon's default state is a smaller floating popover
+            # (~320x540, vertically centered) with no public toggle to
+            # the wider undocked layout. We inject position:fixed CSS so
+            # the panel pins to the left side at 100vh in every
+            # viewport — required for both the top-of-page snap and the
+            # scrolled "Looking for specific info?" snap.
+            #
+            # Critical overrides: visibility/opacity. The panel sits in
+            # the DOM with visibility:hidden + opacity:0 even after
+            # clicking #nav-rufus-disco — animation toggles those back
+            # to visible only briefly. Forcing visibility:visible +
+            # opacity:1 keeps it rendered.
+            print("Forcing Alexa side-panel layout via CSS injection...")
+            page.evaluate("""
+                () => {
+                  const css = `
+                    #nav-flyout-rufus, .rufus-panel-container {
+                      position: fixed !important;
+                      left: 0 !important;
+                      top: 0 !important;
+                      height: 100vh !important;
+                      width: 320px !important;
+                      max-height: 100vh !important;
+                      transform: none !important;
+                      border-radius: 0 !important;
+                      z-index: 999999 !important;
+                      display: block !important;
+                      visibility: visible !important;
+                      opacity: 1 !important;
+                    }
+                  `;
+                  let style = document.getElementById('audit-alexa-css');
+                  if (!style) {
+                    style = document.createElement('style');
+                    style.id = 'audit-alexa-css';
+                    document.head.appendChild(style);
+                  }
+                  style.textContent = css;
+                }
+            """)
+            time.sleep(2)
+
+            # 7a. Top-of-page snap — panel + PDP image + inline pills.
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(1)
+            print(f"Taking top snap -> {top_path.name}")
+            page.screenshot(path=str(top_path), full_page=False)
+            saved.append(top_path)
+
+            # 7b. Scroll to the "Looking for specific info?" section and
+            # snap. That section's heading sits in the page body below
+            # the product card. Find it by text and scroll so the
+            # heading lands ~100px from the top of the viewport.
+            print("Locating 'Looking for specific info?' section...")
+            scrolled = page.evaluate("""
+                () => {
+                  // Pick the smallest element whose DIRECT text starts
+                  // with the phrase. textContent on parent containers
+                  // also matches but their bounding rects are huge,
+                  // useless for scroll-anchoring.
+                  let best = null;
+                  document.querySelectorAll('*').forEach(el => {
+                    let direct = '';
+                    el.childNodes.forEach(n => {
+                      if (n.nodeType === 3) direct += n.textContent;
+                    });
+                    direct = direct.trim();
+                    if (!/looking for specific info/i.test(direct)) return;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 50 || r.height < 10) return;
+                    if (!best || r.height < best.h) {
+                      best = {el, h: r.height};
+                    }
+                  });
+                  if (!best) return -1;
+                  const r = best.el.getBoundingClientRect();
+                  window.scrollTo(0, window.scrollY + r.top - 120);
+                  return Math.round(window.scrollY);
+                }
+            """)
+            if scrolled >= 0:
+                print(f"  scrolled to y={scrolled}")
+                time.sleep(2)
+                print(f"Taking specific-info snap -> {specific_path.name}")
+                page.screenshot(path=str(specific_path), full_page=False)
+                saved.append(specific_path)
+            else:
+                print("  'Looking for specific info?' section not found on "
+                      "this PDP — skipping second snap", file=sys.stderr)
+        finally:
+            browser.close()
+
+    return saved
+
+
 def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
             port: int = CDP_PORT, zoom: float = 0.67) -> Path:
     query = f"I really like the {product_title} can i buy it online"
@@ -774,9 +1012,11 @@ def main() -> int:
     p.add_argument("--sku", default=None,
                    help="Output folder slug. Auto-derived from the title if "
                         "omitted.")
-    p.add_argument("--source", choices=["google", "chatgpt", "both"],
-                   default="both",
-                   help="Which engine(s) to query. Default: both.")
+    p.add_argument("--source",
+                   choices=["google", "chatgpt", "alexa", "all"],
+                   default="all",
+                   help="Which engine(s) to capture. Default: all "
+                        "(google + chatgpt + alexa).")
     p.add_argument("--crop", action="store_true",
                    help="Also run the crop detector after capture. Off by "
                         "default — full screenshots are easier to edit "
@@ -808,8 +1048,9 @@ def main() -> int:
 
     google_shot: Path | None = None
     chatgpt_shot: Path | None = None
+    alexa_shots: list[Path] = []
 
-    if args.source in ("google", "both"):
+    if args.source in ("google", "all"):
         google_shot = capture(
             product_title=title,
             sku=sku,
@@ -818,8 +1059,16 @@ def main() -> int:
             zoom=args.zoom,
         )
 
-    if args.source in ("chatgpt", "both"):
+    if args.source in ("chatgpt", "all"):
         chatgpt_shot = capture_chatgpt(
+            product_title=title,
+            sku=sku,
+            profile_dir=args.profile_dir,
+            port=args.port,
+        )
+
+    if args.source in ("alexa", "all"):
+        alexa_shots = capture_alexa(
             product_title=title,
             sku=sku,
             profile_dir=args.profile_dir,
@@ -828,10 +1077,13 @@ def main() -> int:
 
     print("\nDone.")
     if google_shot:
-        print(f"  Google initial:   {google_shot.with_name('initial.png')}")
+        print(f"  Google initial:    {google_shot.with_name('initial.png')}")
         print(f"  Google post-click: {google_shot}")
     if chatgpt_shot:
-        print(f"  ChatGPT:          {chatgpt_shot}")
+        print(f"  ChatGPT initial:   {chatgpt_shot.with_name('chatgpt_initial.png')}")
+        print(f"  ChatGPT post-click: {chatgpt_shot}")
+    for shot in alexa_shots:
+        print(f"  Alexa:             {shot}")
 
     if not args.crop or not google_shot:
         return 0

@@ -1,7 +1,8 @@
 # SKU Audit Tool — Operating Notes
 
-For any product, captures how Google AI Mode and ChatGPT present it,
-producing 4 raw screenshots ready for manual editing into a slide deck.
+For any product, captures how Google AI Mode, ChatGPT, and Amazon's
+Shopping with Alexa present it, producing 6 raw screenshots ready for
+manual editing into a slide deck.
 
 ## Usage
 
@@ -9,24 +10,32 @@ producing 4 raw screenshots ready for manual editing into a slide deck.
 .venv/bin/python src/capture.py "<product title or retailer URL>"
 .venv/bin/python src/capture.py "Allbirds Wool Runners" --sku allbirds_wool
 .venv/bin/python src/capture.py "https://www.target.com/p/sun-bum-..."
+.venv/bin/python src/capture.py "Hydro Flask" --source alexa
 ```
 
-Defaults: `--source both`, `--zoom 1.0` (no zoom), `--crop` off.
+Defaults: `--source all`, `--zoom 1.0` (no zoom), `--crop` off.
+`--source` accepts: `google`, `chatgpt`, `alexa`, `all`.
 
 Output → `samples/<sku>/`:
 - `initial.png`         Google AI Mode answer (pre-click)
 - `full_page.png`       Google after clicking first product card
 - `chatgpt_initial.png` ChatGPT response (pre-click)
 - `chatgpt.png`         ChatGPT after clicking the inline product card
+- `alexa_top.png`       Amazon PDP + Alexa side panel + inline pills (top of page)
+- `alexa_specific.png`  Amazon PDP scrolled to "Looking for specific info?" pills
 
 ## Setup (one-time)
 
 ```bash
 # Sign in to ChatGPT in the dedicated Chrome profile
 .venv/bin/python src/setup_chatgpt_login.py
-# Sign in via the on-screen Chrome window; it auto-detects + exits.
-# Cookies persist in .chrome-profile/ for future runs.
+
+# Sign in to Amazon (required for Shopping with Alexa to render the panel)
+.venv/bin/python src/setup_alexa_login.py
 ```
+
+Both helpers launch Chrome on-screen at the sign-in URL, auto-detect the
+authenticated state, and exit. Cookies persist in `.chrome-profile/`.
 
 Google sign-in happens automatically on first `capture.py` run — you sign
 in when prompted in the Chrome window that opens.
@@ -90,6 +99,40 @@ Repeat scroll → expand until a round expands less than 100px.
 product card. Google needs extra time to populate retailer offers in
 the panel state. Without this dwell, only ~2 retailers render.
 
+## Shopping with Alexa (amazon)
+
+Amazon rebranded Rufus → "Shopping with Alexa" but the DOM is still
+rufus-prefixed: `#nav-rufus-disco`, `#nav-flyout-rufus`,
+`.rufus-html-turn-contextual-pills`, etc. Don't get confused.
+
+Flow:
+1. Submit search to `amazon.com/s?k=<title>`.
+2. Click the first organic (non-sponsored) `/dp/...` result → PDP.
+3. Click `#nav-rufus-disco` if the panel isn't already visible.
+   **Panel "openness" check uses computed `visibility` + `opacity`,
+   NOT bounding-rect width** — the panel sits in the DOM at
+   320×540 with `visibility:hidden; opacity:0` when closed, so a
+   width-based check returns a false positive.
+4. Wait for `.rufus-html-turn-contextual-pills` to attach (pills lazy-
+   load after the panel opens on a PDP).
+5. Inject CSS to pin the panel as a full-viewport-height left rail
+   (`position: fixed; left:0; top:0; height:100vh; width:320px`) and
+   force `visibility: visible; opacity: 1`. Amazon has no public
+   toggle for this layout — the overflow menu only exposes chat
+   history, new chat, and FAQs.
+6. Take viewport screenshot at scroll y=0 → `alexa_top.png`.
+7. Scroll to the "Looking for specific info?" heading (search by
+   *direct text content*, not parent textContent) such that the
+   heading lands ~120px below the viewport top. Snap →
+   `alexa_specific.png`.
+
+Both snaps are `full_page=False` (viewport only). Tried `full_page=True`
+once — produced a 3440×27000 stitched mess where the side panel only
+rendered at the top because `position:fixed` doesn't survive Playwright
+scroll-stitching. Two readable viewport snaps beat one giant unreadable
+one. The user said they may eventually want a third snap (or more) to
+capture per-pill responses after clicking a pill in the panel.
+
 ## Known sad paths
 
 1. **Google `SmjhRb` fallback doesn't always transition the panel.**
@@ -108,10 +151,19 @@ the panel state. Without this dwell, only ~2 retailers render.
 3. **ChatGPT anonymous mode returns text-only responses.** Run
    `setup_chatgpt_login.py` to fix.
 
+4. **Alexa anonymous mode shows no panel at all.** The
+   `#nav-flyout-rufus` element exists in the DOM but pills never load.
+   Run `setup_alexa_login.py` to fix.
+
+5. **"Looking for specific info?" section is absent on some PDPs**
+   (books, simple commodity items, gift cards). `capture_alexa` skips
+   the second snap and logs a warning rather than failing the run.
+
 ## Files
 
-- `src/capture.py` — main CLI, URL/title parsing, both Google & ChatGPT
+- `src/capture.py` — main CLI, URL/title parsing, Google + ChatGPT + Alexa
 - `src/setup_chatgpt_login.py` — one-time ChatGPT sign-in helper
+- `src/setup_alexa_login.py` — one-time Amazon sign-in helper
 - `src/audit.py`, `src/detect_crops.py` — legacy crop detector (off by default)
 - `src/debug_panel.py` — DOM inspector for diagnosing panel issues
 - `.chrome-profile/` — dedicated Chrome user data dir (gitignore this)
