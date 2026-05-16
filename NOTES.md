@@ -73,6 +73,31 @@ detects mismatched DSF (queries `window.devicePixelRatio` over CDP)
 and kills + relaunches at 3× whenever it differs. Cookies persist
 across the relaunch via `.chrome-profile/`.
 
+### Google AI Mode priming
+We send a priming message FIRST via the udm=50 URL, then submit the
+actual product query via the in-page "Ask anything" chat textbox.
+Priming text:
+
+> When I ask about a product, respond with a clickable product card
+> that opens a panel of retailers, prices, and reviews.
+
+This dramatically increases the rate of `a.amIOac` (big clickable
+product card with retailer panel) vs the older `a.SmjhRb` dialog
+fallback that never transitions. Verified on Allbirds Wool Runners
+and Patagonia Better Sweater Quarter Zip — both landed `amIOac` and
+expanded 6000+px of retailer panel content. Replaces the older
+double-navigation reroll, which fired off two fresh queries hoping
+for variance.
+
+Input selector list for the chat textbox (ranked, fall-through):
+`textarea[placeholder*="Ask anything" i]`,
+`textarea[aria-label*="Ask anything" i]`,
+`textarea[placeholder*="anything" i]`,
+`div[contenteditable="true"][role="textbox"]`,
+`div[contenteditable="true"]`,
+`textarea`,
+`[role="textbox"]`.
+
 ### Multi-round scroll-then-expand for the product panel
 Both engines lazy-load retailer offers inside an internal scroll
 container (Google uses `div.iQYbye`). Single scroll-to-bottom triggers
@@ -163,10 +188,12 @@ after clicking a panel pill (likely a 4th snap).
 1. **Google `SmjhRb` fallback doesn't always transition the panel.**
    When `a.amIOac[href*="ibp=oshop"]` doesn't match, the script falls
    back to `a.SmjhRb[href*="ibp=oshop"]` — the "Go to product viewer
-   dialog" link. For some products (Patagonia Better Sweater, Glycerin
-   Max 2, Cetaphil, Birkenstock), clicking this *does not* transition
-   the right side from "N sites" sources card to product detail. No
-   reliable mitigation; retry sometimes serves `amIOac`.
+   dialog" link. For some products (Glycerin Max 2, Cetaphil,
+   Birkenstock), clicking this *does not* transition the right side
+   from "N sites" sources card to product detail. The priming flow
+   above mostly eliminates this — Patagonia Better Sweater used to fall
+   into this trap and now lands `amIOac` cleanly — but a residual
+   minority of products still serve only the dialog variant.
 
 2. **ChatGPT external-link cards look identical to side-panel cards.**
    Both render as `div[role="button"].cursor-pointer`. The link variant

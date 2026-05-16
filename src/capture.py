@@ -815,18 +815,26 @@ def capture_alexa(product_title: str, sku: str,
     return saved
 
 
+GOOGLE_PRIMING_PROMPT = (
+    "When I ask about a product, respond with a clickable product card "
+    "that opens a panel of retailers, prices, and reviews."
+)
+
+
 def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
             port: int = CDP_PORT, zoom: float = 0.67) -> Path:
     query = f"I really like the {product_title} can i buy it online"
-    url = "https://www.google.com/search?" + urlencode({"q": query, "udm": "50"})
+    priming_url = "https://www.google.com/search?" + urlencode(
+        {"q": GOOGLE_PRIMING_PROMPT, "udm": "50"}
+    )
 
     out_dir = ROOT / "samples" / sku
     out_dir.mkdir(parents=True, exist_ok=True)
     initial_path = out_dir / "initial.png"
     screenshot_path = out_dir / "full_page.png"
 
+    print(f"Priming:  {GOOGLE_PRIMING_PROMPT}")
     print(f"Query:    {query}")
-    print(f"URL:      {url}")
     print(f"Output:   {initial_path}, {screenshot_path}")
 
     launched = launch_chrome_if_needed(profile_dir, port)
@@ -863,21 +871,58 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
             # respects prefers-color-scheme and serves its dark theme.
             page.emulate_media(color_scheme="dark")
 
-            # Google AI Mode is non-deterministic — always run the query
-            # twice and use the second attempt's state. Each attempt is a
-            # fresh roll of the dice on which response variant we get (big
-            # `amIOac` card vs `SmjhRb` dialog link), and the extra ~15s
-            # roughly doubles the odds of landing the clickable card.
-            for attempt in range(2):
-                label = "Navigating" if attempt == 0 else "Re-navigating (2nd prompt)"
-                print(f"{label}...")
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                print("Waiting for AI answer to render...")
+            # Google AI Mode is non-deterministic about which response
+            # variant it serves (big clickable `amIOac` card vs smaller
+            # `SmjhRb` dialog link). To bias toward the card, we send a
+            # priming message FIRST via URL, then follow up with the
+            # actual product query via the in-page chat input. The
+            # follow-up runs in the same AI Mode session so the priming
+            # context persists.
+            print("Sending priming message to Google AI Mode...")
+            page.goto(priming_url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=45000)
+            except Exception:
+                print("  (networkidle timed out — continuing anyway)")
+            time.sleep(8)  # streaming buffer for priming response
+
+            # Find the in-page chat textbox ("Ask anything") and send
+            # the actual product query.
+            print(f"Submitting follow-up product query: {query!r}")
+            input_selectors = [
+                'textarea[placeholder*="Ask anything" i]',
+                'textarea[aria-label*="Ask anything" i]',
+                'textarea[placeholder*="anything" i]',
+                'div[contenteditable="true"][role="textbox"]',
+                'div[contenteditable="true"]',
+                'textarea',
+                '[role="textbox"]',
+            ]
+            inp = None
+            for sel in input_selectors:
+                loc = page.locator(sel)
+                try:
+                    if loc.count() > 0 and loc.first.is_visible():
+                        inp = loc.first
+                        print(f'  using input selector "{sel}"')
+                        break
+                except Exception:
+                    continue
+            if inp is None:
+                print("ERROR: could not find Google AI Mode chat input — "
+                      "screenshots will show the priming response state.",
+                      file=sys.stderr)
+            else:
+                inp.click()
+                page.keyboard.type(query, delay=8)
+                time.sleep(0.5)
+                page.keyboard.press("Enter")
+                print("Submitted. Waiting for follow-up response to render...")
                 try:
                     page.wait_for_load_state("networkidle", timeout=45000)
                 except Exception:
                     print("  (networkidle timed out — continuing anyway)")
-                time.sleep(6)  # streaming buffer
+                time.sleep(8)  # streaming buffer
 
             # First screenshot: AI Mode result as it loads, before click.
             print(f"Taking initial screenshot -> {initial_path.name}...")
