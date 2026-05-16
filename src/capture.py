@@ -191,13 +191,60 @@ def _cdp_ready(port: int) -> bool:
         return False
 
 
+def _current_chrome_dsf(port: int) -> float | None:
+    """Connect to a running Chrome and read its devicePixelRatio. Returns
+    None on any failure (Chrome not running, no pages, etc.)."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            ctx = browser.contexts[0]
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            dsf = page.evaluate("() => window.devicePixelRatio")
+            browser.close()
+            return float(dsf)
+    except Exception:
+        return None
+
+
+def _kill_chrome_on_port(profile_dir: Path, port: int) -> None:
+    """Terminate any Chrome bound to --remote-debugging-port=<port> and
+    clean up Singleton lockfiles so the next launch can claim the
+    profile."""
+    subprocess.call(
+        ["pkill", "-9", "-f", f"remote-debugging-port={port}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)
+    for p in profile_dir.glob("Singleton*"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+# Required DSF for capture screenshots. Setup helpers launch Chrome at
+# 2x (readable for sign-in UX), but captures must use 3x — without this
+# screenshots come out at ~3440px wide instead of the ~5184px native
+# the user expects.
+REQUIRED_DSF = 3.0
+
+
 def launch_chrome_if_needed(profile_dir: Path, port: int = CDP_PORT) -> bool:
-    """Start a Chrome window with --remote-debugging-port if it isn't already
-    running on that port. Returns True if we launched it, False if it was
-    already up."""
+    """Ensure Chrome is running on `port` with the capture-mode flags
+    (off-screen window, 3x device scale factor). If an existing Chrome
+    is at the wrong DSF (e.g. left over from setup_*_login.py at 2x),
+    kill and relaunch — cookies persist in the profile directory.
+
+    Returns True if we launched/relaunched, False if we reused."""
     if _cdp_ready(port):
-        print(f"Reusing existing Chrome on port {port}.")
-        return False
+        dsf = _current_chrome_dsf(port)
+        if dsf is not None and abs(dsf - REQUIRED_DSF) < 0.1:
+            print(f"Reusing existing Chrome on port {port} (DSF {dsf}).")
+            return False
+        print(f"Existing Chrome on port {port} at DSF {dsf}, "
+              f"need {REQUIRED_DSF} — relaunching...")
+        _kill_chrome_on_port(profile_dir, port)
 
     if not Path(CHROME_PATH).exists():
         raise RuntimeError(f"Chrome not found at {CHROME_PATH}")
@@ -532,12 +579,13 @@ def capture_alexa(product_title: str, sku: str,
     out_dir = ROOT / "samples" / sku
     out_dir.mkdir(parents=True, exist_ok=True)
     top_path = out_dir / "alexa_top.png"
-    specific_path = out_dir / "alexa_specific.png"
+    inline_path = out_dir / "alexa_inline.png"
+    qa_path = out_dir / "alexa_qa.png"
     saved: list[Path] = []
 
     print(f"\n[Alexa]")
     print(f"Query:    {product_title!r}")
-    print(f"Outputs:  {top_path.name}, {specific_path.name}")
+    print(f"Outputs:  {top_path.name}, {inline_path.name}, {qa_path.name}")
 
     launch_chrome_if_needed(profile_dir, port)
 
@@ -688,24 +736,49 @@ def capture_alexa(product_title: str, sku: str,
             """)
             time.sleep(2)
 
-            # 7a. Top-of-page snap — panel + PDP image + inline pills.
+            # 7a. Top-of-page snap — side panel + PDP product card.
             page.evaluate("window.scrollTo(0, 0)")
             time.sleep(1)
             print(f"Taking top snap -> {top_path.name}")
             page.screenshot(path=str(top_path), full_page=False)
             saved.append(top_path)
 
-            # 7b. Scroll to the "Looking for specific info?" section and
-            # snap. That section's heading sits in the page body below
-            # the product card. Find it by text and scroll so the
-            # heading lands ~100px from the top of the viewport.
-            print("Locating 'Looking for specific info?' section...")
+            # 7b. Scroll to the inline Alexa pills under the product
+            # card. The section is wrapped in
+            # #dpx-nice-widget-container, header is <h5>Ask a question</h5>,
+            # pills are <button class="small-widget-pill">. Anchor on
+            # the container; scroll so its top sits ~200px below the
+            # viewport top (room to show the bottom of the product
+            # card above + all pills below the header).
+            print("Locating inline 'Ask a question' Alexa pills...")
             scrolled = page.evaluate("""
                 () => {
-                  // Pick the smallest element whose DIRECT text starts
-                  // with the phrase. textContent on parent containers
-                  // also matches but their bounding rects are huge,
-                  // useless for scroll-anchoring.
+                  const c = document.querySelector('#dpx-nice-widget-container') ||
+                            document.querySelector('button.small-widget-pill')?.closest('div, section');
+                  if (!c) return -1;
+                  const r = c.getBoundingClientRect();
+                  window.scrollTo(0, window.scrollY + r.top - 200);
+                  return Math.round(window.scrollY);
+                }
+            """)
+            if scrolled >= 0:
+                print(f"  scrolled to y={scrolled}")
+                time.sleep(2)
+                print(f"Taking inline snap -> {inline_path.name}")
+                page.screenshot(path=str(inline_path), full_page=False)
+                saved.append(inline_path)
+            else:
+                print("  inline Alexa pills not found on this PDP — "
+                      "skipping inline snap", file=sys.stderr)
+
+            # 7c. Scroll to the "Looking for specific info?" Q&A pill
+            # block (further down the page, near Top Brand / related
+            # carousel). Match the smallest element whose direct text
+            # starts with the phrase, so we hit the heading itself
+            # rather than a huge ancestor container.
+            print("Locating 'Looking for specific info?' Q&A section...")
+            scrolled = page.evaluate("""
+                () => {
                   let best = null;
                   document.querySelectorAll('*').forEach(el => {
                     let direct = '';
@@ -722,19 +795,20 @@ def capture_alexa(product_title: str, sku: str,
                   });
                   if (!best) return -1;
                   const r = best.el.getBoundingClientRect();
-                  window.scrollTo(0, window.scrollY + r.top - 120);
+                  window.scrollTo(0, window.scrollY + r.top - 200);
                   return Math.round(window.scrollY);
                 }
             """)
             if scrolled >= 0:
                 print(f"  scrolled to y={scrolled}")
                 time.sleep(2)
-                print(f"Taking specific-info snap -> {specific_path.name}")
-                page.screenshot(path=str(specific_path), full_page=False)
-                saved.append(specific_path)
+                print(f"Taking Q&A snap -> {qa_path.name}")
+                page.screenshot(path=str(qa_path), full_page=False)
+                saved.append(qa_path)
             else:
-                print("  'Looking for specific info?' section not found on "
-                      "this PDP — skipping second snap", file=sys.stderr)
+                print("  'Looking for specific info?' Q&A section not "
+                      "found on this PDP — skipping Q&A snap",
+                      file=sys.stderr)
         finally:
             browser.close()
 
