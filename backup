@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Backup the project: optional git commit + always a fresh tarball.
+# Keeps the last 10 tarballs, prunes older ones.
+#
+# Usage:
+#   ./backup                       # just create a tarball
+#   ./backup "describe the change" # git commit + tarball
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+ROOT=$(pwd)
+PARENT=$(dirname "$ROOT")
+NAME=$(basename "$ROOT")
+STAMP=$(date +%Y%m%d-%H%M)
+TARBALL="$PARENT/${NAME}-backup-${STAMP}.tar.gz"
+
+# 1. Optional git commit
+if [[ $# -ge 1 ]] && [[ -n "$1" ]]; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git add -A
+    git -c user.email=local@sku-audit -c user.name=local commit -m "$1"
+    echo "✓ git: committed '$1'"
+  else
+    echo "  git: nothing to commit"
+  fi
+else
+  # Even with no commit message, warn about uncommitted changes.
+  if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+    echo "  git: uncommitted changes (run \`./backup \"message\"\` to commit them)"
+  fi
+fi
+
+# 2. Tarball — excludes regeneratable/private dirs.
+tar czf "$TARBALL" \
+  --exclude="$NAME/.venv" \
+  --exclude="$NAME/.chrome-profile" \
+  --exclude="$NAME/samples" \
+  --exclude="$NAME/output" \
+  --exclude="$NAME/.DS_Store" \
+  -C "$PARENT" "$NAME"
+
+SIZE=$(du -h "$TARBALL" | cut -f1)
+echo "✓ tar: $TARBALL ($SIZE)"
+
+# 3. Prune — keep newest 10 tarballs only.
+KEEP=10
+OLD=$(ls -1t "$PARENT/${NAME}-backup-"*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) || true)
+if [[ -n "$OLD" ]]; then
+  echo "  pruning $(echo "$OLD" | wc -l | tr -d ' ') old backup(s) beyond newest $KEEP..."
+  echo "$OLD" | xargs rm -f
+fi
+
+echo "Done."
