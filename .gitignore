@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Browser session — contains personal Google/OpenAI auth, large, regeneratable
+.chrome-profile/
+.pw-profile/
+
+# Captured screenshots — regeneratable from capture.py
+samples/
+output/
+
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
