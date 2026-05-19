@@ -17,3 +17,7 @@ output/
 *.swp
 .vscode/
 .idea/
+
+# Debug / ad-hoc image artifacts
+thumbnails-*.jpg
+thumbnails-*.png
