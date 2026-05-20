@@ -220,273 +220,66 @@ CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CDP_PORT = 9222
 
 
-def find_first_product_link(page: Page, product_title: str = "") -> bool:
-    """Click the product-viewer-dialog anchor that wraps Google's
-    inline product card.
+def find_first_product_link(page: Page) -> bool:
+    """Click the first product-entry card in the left/center AI answer column.
 
-    The clickable anchor signature (confirmed via DOM inspection):
-        <a class="SmjhRb amIOac" role="button" tabindex="0"
-           id="pvlink..." aria-describedby="pvlink-desc-..."
-           href="/search?ibp=oshop&prds=...">
-
-    The `id="pvlink..."` + `aria-describedby="pvlink-desc-..."` pair
-    is the most unique signal — every product-card anchor uses it,
-    nothing else does. We use that as the primary selector, with
-    href-based fallbacks for layout variants.
-
-    If no such anchor exists in the response, the AI Mode response
-    didn't render a product card and we bail.
+    Google AI Mode product cards have hrefs like
+    `https://www.google.com/search?ibp=oshop&prds=...` and a class signature
+    including `amIOac` (subject to change — Google's class names are
+    auto-generated). We pick the topmost such card with substantial size
+    (width >= 400, height >= 60) — small inline product-viewer links are
+    also `ibp=oshop` but are tiny and shouldn't be clicked.
     """
-    # The page has multiple product-viewer-link anchors:
-    #   1. ONE "big card" anchor that wraps the product tile
-    #      (image + title + price + retailer + rating). Clicking
-    #      it opens the product viewer dialog.
-    #   2. Several "inline text" anchors that wrap just the
-    #      product-name phrase elsewhere in the response. These
-    #      also have id="pvlink..." but contain NO image child
-    #      and clicking them either does nothing useful or
-    #      scrolls.
-    # The big card is the only one with an <img> descendant —
-    # use that as the distinguisher. Pick the topmost matching one.
-    selectors = [
-        'a[id^="pvlink"][href*="ibp=oshop"]:has(img)',
-        'a.amIOac[href*="ibp=oshop"]:has(img)',
-        'a.SmjhRb[href*="ibp=oshop"]:has(img)',
+    # Try the big-card class first (most common), then any SmjhRb link (used
+    # for narrower product-viewer-style entries), then a generic ibp=oshop
+    # fallback. Pick the topmost-leftmost qualifying link.
+    viewport = page.viewport_size or {"width": 1440, "height": 900}
+    left_threshold = viewport["width"] * 0.6
+
+    selector_attempts = [
+        ('a.amIOac[href*="ibp=oshop"]', 400, 60),
+        ('a.SmjhRb[href*="ibp=oshop"]', 100, 15),
+        ('a[href*="ibp=oshop"]', 100, 15),
+        ('a[href*="/shopping/product/"]', 100, 15),
     ]
-    for sel in selectors:
-        loc = page.locator(sel)
+
+    for sel, min_w, min_h in selector_attempts:
+        links = page.locator(sel)
         try:
-            count = loc.count()
+            count = links.count()
         except Exception:
             continue
         if count == 0:
             continue
-        topmost = None
-        topmost_y = float("inf")
-        for i in range(min(count, 20)):
-            link = loc.nth(i)
+
+        candidates = []
+        for i in range(min(count, 30)):
+            link = links.nth(i)
             try:
                 if not link.is_visible():
                     continue
                 box = link.bounding_box()
-                if box is None:
+                if box is None or box["width"] < min_w or box["height"] < min_h:
                     continue
-                if box["y"] < topmost_y:
-                    topmost_y = box["y"]
-                    topmost = (link, box)
+                # Stay in the left/center column of the viewport.
+                if box["x"] + box["width"] / 2 > left_threshold:
+                    continue
+                text = (link.text_content() or "").strip()
+                if len(text) < 8:
+                    continue
+                candidates.append((box["y"], box, text, link))
             except Exception:
                 continue
-        if topmost is None:
+        if not candidates:
             continue
-        link, box = topmost
-        text = (link.text_content() or "").strip()[:80]
-        print(f'  selector "{sel}" -> "{text}" at '
-              f'({box["x"]:.0f}, {box["y"]:.0f})')
-        try:
-            link.scroll_into_view_if_needed(timeout=3000)
-            link.click(timeout=5000)
-            return True
-        except Exception as e:
-            print(f'  click failed via {sel}: {e}', file=sys.stderr)
-            continue
+        candidates.sort(key=lambda c: c[0])
+        _, box, text, link = candidates[0]
+        print(f'  selector "{sel}" matched: "{text[:60]}" at ({box["x"]:.0f}, {box["y"]:.0f})')
+        link.scroll_into_view_if_needed(timeout=3000)
+        link.click(timeout=5000)
+        return True
+    return False
 
-    # If we got here, no product-viewer anchor exists -> Google didn't
-    # render a clickable product card in this response.
-    viewport = page.viewport_size or {"width": 1440, "height": 900}
-    left_threshold = viewport["width"] * 0.6
-
-    # Tokens kept only for the legacy debug dump path below.
-    import re as _re
-    tokens = [
-        t.lower() for t in _re.split(r"[^A-Za-z0-9]+", product_title)
-        if len(t) >= 3
-    ]
-    title_len = len(product_title.strip())
-    max_text_len = max(80, int(title_len * 1.6)) if title_len else 120
-
-    candidates = page.evaluate(r"""
-        ({tokens, leftThreshold, maxTextLen}) => {
-          const out = [];
-          const seen = new WeakSet();
-          const sel = 'a, button, span, [role="link"], [role="button"]';
-          document.querySelectorAll(sel).forEach(el => {
-            if (seen.has(el)) return;
-            const r = el.getBoundingClientRect();
-            if (r.width < 30 || r.height < 8) return;
-            if (r.x + r.width / 2 > leftThreshold) return;  // left column only
-            const text = (el.textContent || '').trim();
-            if (text.length < 3 || text.length > maxTextLen) return;
-
-            // Skip obvious user-query phrasing — these are echoed back in
-            // the chat history but aren't clickable product references.
-            if (/^i really (want|like) /i.test(text)) return;
-            if (/^when i ask about a product/i.test(text)) return;
-
-            // Must look clickable. Google renders inline entity links
-            // (dotted-underline references) with cursor:pointer — that's
-            // the universal signal regardless of how the underline dots
-            // are visually drawn (text-decoration, border-bottom, or a
-            // pseudo-element background pattern).
-            const cs = getComputedStyle(el);
-            const tag = el.tagName.toLowerCase();
-            const role = (el.getAttribute('role') || '').toLowerCase();
-            const isClickable =
-              tag === 'a' || tag === 'button'
-              || role === 'link' || role === 'button'
-              || cs.cursor === 'pointer';
-            if (!isClickable) return;
-            // Drop obvious UI chrome (nav tabs, accessibility links,
-            // "Sources", "More" menus, etc.).
-            const lowerText = text.toLowerCase();
-            const cls = ((el.className && el.className.toString) ?
-                          el.className.toString() : '').toLowerCase();
-            const href = (el.getAttribute('href') || '').toLowerCase();
-            if (/c6ak7c|gypp\w*|mtpl7c/.test(cls)) return;
-            if (/google\.com\/support|accessibility/.test(href)) return;
-            if (/^(accessibility|skip to|ai mode|all|images|videos|news|more|sources|upgrade|share)$/i.test(lowerText)) return;
-
-            // Visual underline check — Google renders the "dotted
-            // entity underline" via a ::after pseudo-element with a
-            // background-image dot pattern, so plain text-decoration
-            // / border-bottom checks miss it. We also check
-            // ::after / ::before for a background-image (image: url
-            // or repeating gradient) on a sub-1em-height pseudo-box.
-            const line = (cs.textDecorationLine || '').toLowerCase();
-            const tdStyle = (cs.textDecorationStyle || '').toLowerCase();
-            const bbStyle = (cs.borderBottomStyle || '').toLowerCase();
-            const bbWidth = parseFloat(cs.borderBottomWidth || '0');
-            let visualDotted =
-              (line.includes('underline') &&
-                 (tdStyle === 'dotted' || tdStyle === 'dashed'))
-              || ((bbStyle === 'dotted' || bbStyle === 'dashed') && bbWidth > 0);
-
-            if (!visualDotted) {
-              for (const pe of ['::after', '::before']) {
-                const ps = getComputedStyle(el, pe);
-                const content = ps.content || '';
-                if (content === 'none' || content === 'normal') continue;
-                const bgImg = ps.backgroundImage || '';
-                const tdLineP = (ps.textDecorationLine || '').toLowerCase();
-                const tdStyleP = (ps.textDecorationStyle || '').toLowerCase();
-                const bbStyleP = (ps.borderBottomStyle || '').toLowerCase();
-                const hasDotPattern =
-                  /radial-gradient|repeating-linear-gradient/.test(bgImg)
-                  || (tdLineP.includes('underline')
-                      && (tdStyleP === 'dotted' || tdStyleP === 'dashed'))
-                  || bbStyleP === 'dotted' || bbStyleP === 'dashed';
-                if (hasDotPattern) { visualDotted = true; break; }
-              }
-            }
-
-            // Text-token overlap with product title — used as the
-            // primary signal when the visual-dotted CSS detection
-            // misses (Google renders via pseudo-element).
-            let hits = 0;
-            for (const t of tokens) {
-              if (lowerText.includes(t)) hits++;
-            }
-            const textMatch = tokens.length > 0 && hits >= 2;
-            if (!visualDotted && !textMatch) return;
-            seen.add(el);
-            out.push({
-              x: r.x, y: r.y, w: r.width, h: r.height, text,
-              visualDotted, textMatch, hits, totalTokens: tokens.length,
-            });
-          });
-          return out;
-        }
-    """, {"tokens": tokens, "leftThreshold": left_threshold,
-          "maxTextLen": max_text_len})
-
-    if not candidates:
-        # Debug dump — list every clickable element in the left column
-        # with its text, classes, and inline + computed style fragments
-        # so we can see what Google is using for the dotted underline.
-        try:
-            debug = page.evaluate(r"""
-                ({leftThreshold}) => {
-                  const out = [];
-                  // Dump EVERY clickable element + every text-bearing
-                  // span/div to see what styling Google actually uses
-                  // for the dotted underline. Include pseudo-elements.
-                  document.querySelectorAll('*').forEach(el => {
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 15 || r.height < 8) return;
-                    if (r.x + r.width / 2 > leftThreshold) return;
-                    const text = (el.textContent || '').trim();
-                    if (text.length < 3 || text.length > 120) return;
-                    const cs = getComputedStyle(el);
-                    const after = getComputedStyle(el, '::after');
-                    const before = getComputedStyle(el, '::before');
-                    // Only emit if the element OR its pseudo-elements
-                    // hint at any decoration / clickability.
-                    const isInteresting =
-                      cs.cursor === 'pointer'
-                      || cs.textDecorationLine !== 'none'
-                      || cs.borderBottomStyle !== 'none'
-                      || (cs.backgroundImage && cs.backgroundImage !== 'none')
-                      || after.content !== 'none' && after.content !== 'normal'
-                      || before.content !== 'none' && before.content !== 'normal';
-                    if (!isInteresting) return;
-                    out.push({
-                      tag: el.tagName,
-                      cls: (el.className && el.className.toString ?
-                            el.className.toString() : '').slice(0, 100),
-                      text: text.slice(0, 80),
-                      x: Math.round(r.x), y: Math.round(r.y),
-                      w: Math.round(r.width), h: Math.round(r.height),
-                      td: cs.textDecorationLine + '/' + cs.textDecorationStyle,
-                      bb: cs.borderBottomStyle + ' ' + cs.borderBottomWidth,
-                      bg: (cs.backgroundImage || '').slice(0, 100),
-                      cursor: cs.cursor,
-                      after_content: (after.content || '').slice(0, 30),
-                      after_bg: (after.backgroundImage || '').slice(0, 100),
-                      after_td: after.textDecorationLine + '/' + after.textDecorationStyle,
-                      after_bb: after.borderBottomStyle + ' ' + after.borderBottomWidth,
-                      before_bg: (before.backgroundImage || '').slice(0, 100),
-                      mask: (cs.maskImage || cs.webkitMaskImage || '').slice(0, 100),
-                    });
-                  });
-                  return out.slice(0, 120);
-                }
-            """, {"leftThreshold": left_threshold})
-            from pathlib import Path as _P
-            dbg_path = _P(__file__).resolve().parent.parent / "output" / "google_dotted_debug.txt"
-            dbg_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(dbg_path, "w") as f:
-                for d in debug:
-                    f.write(
-                        f"{d['tag']} @({d['x']},{d['y']}) {d['w']}x{d['h']} cls={d['cls'][:60]!r} cursor={d['cursor']}\n"
-                        f"  text={d['text']!r}\n"
-                        f"  td={d['td']}  bb={d['bb']}\n"
-                        f"  bg={d['bg']!r}\n"
-                        f"  ::after content={d['after_content']!r} bg={d['after_bg']!r}\n"
-                        f"  ::after td={d['after_td']}  bb={d['after_bb']}\n"
-                        f"  ::before bg={d['before_bg']!r}\n"
-                        f"  mask={d['mask']!r}\n\n"
-                    )
-            print(f"  → dumped clickable-element styles to {dbg_path}")
-        except Exception as _e:
-            print(f"  (style debug dump failed: {_e})", file=sys.stderr)
-        return False
-
-    # Rank: visualDotted wins outright, then highest token-hit count,
-    # then topmost, then leftmost.
-    candidates.sort(key=lambda d: (
-        0 if d["visualDotted"] else 1,
-        -d["hits"],
-        d["y"],
-        d["x"],
-    ))
-    pick = candidates[0]
-    why = "dotted-underline" if pick["visualDotted"] else (
-        f"text-match {pick['hits']}/{pick['totalTokens']}"
-    )
-    print(f'  {why}: "{pick["text"][:60]}" '
-          f'at ({pick["x"]:.0f}, {pick["y"]:.0f})')
-    page.mouse.click(pick["x"] + pick["w"] / 2,
-                     pick["y"] + pick["h"] / 2)
-    return True
 
 
 def _port_is_open(port: int) -> bool:
@@ -595,9 +388,47 @@ def launch_chrome_if_needed(profile_dir: Path, port: int = CDP_PORT) -> bool:
         raise RuntimeError(f"Chrome not found at {CHROME_PATH}")
 
     profile_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear any "Crashed" exit_type left over from an abnormal shutdown.
+    # Otherwise Chrome shows a session-restore infobar on relaunch that
+    # intercepts the FIRST navigation with net::ERR_ABORTED.
+    import json as _json
+    for prefs in profile_dir.glob("*/Preferences"):
+        try:
+            data = _json.loads(prefs.read_text())
+            prof = data.setdefault("profile", {})
+            if prof.get("exit_type") != "Normal" or prof.get("exited_cleanly") is not True:
+                prof["exit_type"] = "Normal"
+                prof["exited_cleanly"] = True
+                prefs.write_text(_json.dumps(data))
+        except Exception:
+            pass
+
     chrome_args = [CHROME_PATH, f"--remote-debugging-port={port}",
                    f"--user-data-dir={profile_dir}",
                    "--no-first-run", "--no-default-browser-check",
+                   # Suppress the session-restore bubble that races with
+                   # first nav and causes ERR_ABORTED.
+                   "--hide-crash-restore-bubble",
+                   "--disable-session-crashed-bubble",
+                   # CRITICAL: Chrome started hijacking google.com/search
+                   # ?udm=50 URLs and redirecting them to its own internal
+                   # chrome://contextual-tasks/ surface, which renders
+                   # via Chrome's WebUI bindings instead of normal DOM.
+                   # The content is visible on-screen but completely
+                   # invisible to document.querySelectorAll — so no
+                   # script can find/click product cards. Broad
+                   # disable-features list to turn off every flag I know
+                   # of that could trigger this redirect.
+                   "--disable-features="
+                   "ContextualSearch,ContextualPageActions,"
+                   "ContextualTasks,ContextualTasksUI,"
+                   "GlicSidePanel,GlicHotkey,Glic,GeminiBrowser,"
+                   "AIChromeMode,AICompose,AIComposeSearchSuggestions,"
+                   "TabContextualization,BrowserAIChat,"
+                   "OmniboxAITasks,ChromeAITasks,"
+                   "LensSearchPage,LensRegionSearch,"
+                   "AISummarization",
                    # Position off-screen + reasonable size so Chrome doesn't
                    # grab focus or overlay the user's current work. Page
                    # still renders normally; screenshots use the renderer
@@ -879,14 +710,9 @@ def capture_chatgpt(product_title: str, sku: str,
             except Exception as e:
                 print(f"  bottom trim skipped ({e})", file=sys.stderr)
         finally:
-            # Close our own tab so we don't leave audit pages in the
-            # user's working window. Guard against closing the last tab
-            # (which would terminate Chrome).
-            try:
-                if len(ctx.pages) > 1:
-                    page.close()
-            except Exception:
-                pass
+            # Leave the ChatGPT tab open after capture so the user can do
+            # follow-up research on the response (look for hallucinations,
+            # bad takes, etc). Only disconnect Playwright from Chrome.
             browser.close()
 
     return screenshot_path
@@ -1365,11 +1191,8 @@ def capture_alexa(product_title: str, sku: str,
                 page.screenshot(path=str(out_path), full_page=False)
                 saved.append(out_path)
         finally:
-            try:
-                if len(ctx.pages) > 1:
-                    page.close()
-            except Exception:
-                pass
+            # Leave the Amazon PDP / Alexa tab open after capture so the
+            # user can continue prompting Alexa for hallucinations.
             browser.close()
 
     return saved
@@ -1575,7 +1398,7 @@ GOOGLE_PRIMING_PROMPT = (
 
 def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
             port: int = CDP_PORT, zoom: float = 0.67) -> Path:
-    query = f"I really want to buy the {product_title}"
+    query = f"I really like the {product_title} can i buy it online"
     priming_url = "https://www.google.com/search?" + urlencode(
         {"q": GOOGLE_PRIMING_PROMPT, "udm": "50"}
     )
@@ -1615,42 +1438,51 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
     with sync_playwright() as p:
         browser: Browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         ctx = browser.contexts[0]
-        # Always open a fresh tab — background mode so we don't steal
-        # focus from whatever the user is doing.
-        page = _open_background_page(ctx, browser)
-        # Force dark-scheme rendering on this tab only. Google AI Mode
-        # respects prefers-color-scheme; without this the fresh CDP tab
-        # opens in light mode even when the user's system / signed-in
-        # preference is dark. Per-page scope means other tabs are not
-        # affected.
+        # Reuse the existing tab if one exists. new_page() can fail when
+        # Chrome is in a sign-in/error state from a prior session.
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         try:
+            # Force dark mode via media-query emulation. Google AI Mode
+            # respects prefers-color-scheme and serves its dark theme.
             page.emulate_media(color_scheme="dark")
-        except Exception as e:
-            print(f"  could not set color scheme ({e})", file=sys.stderr)
-        # New tabs created via CDP don't inherit the launch --window-size
-        # and default to 1280x720, which clips the Google AI Mode panel
-        # in screenshots. Match the Chrome window dimensions at 3x DSF
-        # so captures stay at the same resolution we had when we were
-        # reusing the launch tab.
-        try:
-            cdp = page.context.new_cdp_session(page)
-            cdp.send("Emulation.setDeviceMetricsOverride", {
-                "width": 1728,
-                "height": 912,
-                "deviceScaleFactor": 3,
-                "mobile": False,
-            })
-        except Exception as e:
-            print(f"  could not set viewport ({e}) — captures may be small",
-                  file=sys.stderr)
-        try:
+
             # Google AI Mode is non-deterministic about which response
-            # variant it serves: sometimes a clickable product card
-            # carousel, sometimes a text-only answer with no card to
-            # click. We retry up to MAX_GOOGLE_RETRIES times if no
-            # product card is rendered — each retry starts a fresh
-            # AI Mode session (re-navigate to the priming URL).
-            MAX_GOOGLE_RETRIES = 3
+            # variant it serves (big clickable `amIOac` card vs smaller
+            # `SmjhRb` dialog link). To bias toward the card, we send a
+            # priming message FIRST via URL, then follow up with the
+            # actual product query via the in-page chat input. The
+            # follow-up runs in the same AI Mode session so the priming
+            # context persists.
+            print("Sending priming message to Google AI Mode...")
+            # Chrome redirects google.com/search?udm=50 to
+            # chrome://contextual-tasks/, which makes page.goto throw
+            # ERR_ABORTED even though the page loads. Drive via JS.
+            try:
+                page.evaluate(f"window.location.href = {priming_url!r}")
+            except Exception:
+                try:
+                    page.goto(priming_url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as _e:
+                    if "ERR_ABORTED" not in str(_e) and "net::" not in str(_e):
+                        raise
+            t0 = time.time()
+            while time.time() - t0 < 30:
+                try:
+                    cur = page.url or ""
+                    if (("udm=50" in cur and "google.com/search" in cur)
+                            or cur.startswith("chrome://contextual-tasks/")):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            try:
+                page.wait_for_load_state("networkidle", timeout=45000)
+            except Exception:
+                print("  (networkidle timed out — continuing anyway)")
+            time.sleep(8)  # streaming buffer for priming response
+
+            # Find the in-page chat textbox ("Ask anything"). The product
+            # query is submitted inside the retry loop below.
             input_selectors = [
                 'textarea[placeholder*="Ask anything" i]',
                 'textarea[aria-label*="Ask anything" i]',
@@ -1660,72 +1492,109 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
                 'textarea',
                 '[role="textbox"]',
             ]
-            got_card = False
-            for attempt in range(1, MAX_GOOGLE_RETRIES + 1):
-                tag = f"attempt {attempt}/{MAX_GOOGLE_RETRIES}"
-                print(f"Sending priming message to Google AI Mode ({tag})...")
-                page.goto(priming_url, wait_until="domcontentloaded",
-                          timeout=45000)
+            inp = None
+            for sel in input_selectors:
+                loc = page.locator(sel)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=45000)
+                    if loc.count() > 0 and loc.first.is_visible():
+                        inp = loc.first
+                        print(f'  using input selector "{sel}"')
+                        break
                 except Exception:
-                    print("  (networkidle timed out — continuing anyway)")
-                time.sleep(8)  # streaming buffer for priming response
-
-                # Find the in-page chat textbox ("Ask anything") and
-                # send the actual product query.
-                print(f"Submitting follow-up product query: {query!r}")
-                inp = None
-                for sel in input_selectors:
-                    loc = page.locator(sel)
-                    try:
-                        if loc.count() > 0 and loc.first.is_visible():
-                            inp = loc.first
-                            if attempt == 1:
-                                print(f'  using input selector "{sel}"')
+                    continue
+            if inp is None:
+                print("ERROR: could not find Google AI Mode chat input — "
+                      "screenshots will show the priming response state.",
+                      file=sys.stderr)
+            else:
+                # Submit the product query. Probe for a product card.
+                # If no card after streaming completes, re-submit the
+                # SAME query in the SAME chat (no re-navigation, no
+                # priming resend) up to MAX_INCHAT_RETRIES times.
+                # This is the "ask again in chat" reprompt the user asked
+                # for — it usually nudges Gemini into rendering a card on
+                # the second/third attempt.
+                MAX_INCHAT_RETRIES = 3
+                _card_probe = """() => {
+                    return document.querySelectorAll(
+                        'a.amIOac[href*="ibp=oshop"], '
+                        + 'a.SmjhRb[href*="ibp=oshop"], '
+                        + 'a[id^="pvlink"][href*="ibp=oshop"], '
+                        + 'a[href*="ibp=oshop"]'
+                    ).length;
+                }"""
+                for attempt in range(1, MAX_INCHAT_RETRIES + 1):
+                    tag = f"attempt {attempt}/{MAX_INCHAT_RETRIES}"
+                    if attempt > 1:
+                        # Re-find the input — the DOM may have changed
+                        # after the previous response rendered.
+                        inp = None
+                        for sel in input_selectors:
+                            loc = page.locator(sel)
+                            try:
+                                if loc.count() > 0 and loc.first.is_visible():
+                                    inp = loc.first
+                                    break
+                            except Exception:
+                                continue
+                        if inp is None:
+                            print("  could not re-find chat input — giving up",
+                                  file=sys.stderr)
                             break
+                        print(f"  reprompting in chat ({tag}): {query!r}")
+                    else:
+                        print(f"Submitting product query ({tag}): {query!r}")
+                    try:
+                        inp.click(timeout=5000)
+                        page.keyboard.type(query, delay=8)
+                        time.sleep(0.5)
+                        page.keyboard.press("Enter")
+                    except Exception as _se:
+                        print(f"  submit failed ({_se})", file=sys.stderr)
+                        break
+                    print("  Waiting for response to render + product card "
+                          "to appear (poll up to 35s)...")
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=20000)
                     except Exception:
-                        continue
-                if inp is None:
-                    print("ERROR: could not find Google AI Mode chat "
-                          "input — bailing.", file=sys.stderr)
-                    break
-
-                inp.click()
-                page.keyboard.type(query, delay=8)
-                time.sleep(0.5)
-                page.keyboard.press("Enter")
-                print("Submitted. Waiting for follow-up response to render...")
-                try:
-                    page.wait_for_load_state("networkidle", timeout=45000)
-                except Exception:
-                    print("  (networkidle timed out — continuing anyway)")
-                time.sleep(8)  # streaming buffer
-
-                # Probe: did Google render a clickable product card?
-                # The signature is an <a id="pvlink..."> anchor that
-                # wraps a product image.
-                try:
-                    card_count = page.locator(
-                        'a[id^="pvlink"][href*="ibp=oshop"]:has(img)'
-                    ).count()
-                except Exception:
+                        print("  (networkidle timed out — continuing anyway)")
+                    # Poll for the card over 35s. Gemini's response streams
+                    # in, and product cards typically render mid-stream (or
+                    # right after text completes). Probing once after a
+                    # fixed sleep gives a false negative — by the time the
+                    # card actually renders, we've already reprompted.
+                    # Polling waits for the card to appear instead of
+                    # gambling on a single read.
                     card_count = 0
-                if card_count > 0:
-                    print(f"  ✓ product card rendered on {tag}")
-                    got_card = True
-                    break
-                if attempt < MAX_GOOGLE_RETRIES:
-                    print(f"  ✗ no product card on {tag} — retrying "
-                          "with a fresh AI Mode session...")
-                    time.sleep(2)
-                else:
-                    print(f"  ✗ no product card after {attempt} attempts "
-                          "— engine returned text-only, proceeding "
-                          "without click.")
+                    poll_deadline = time.time() + 35
+                    last_log = 0
+                    while time.time() < poll_deadline:
+                        try:
+                            card_count = page.evaluate(_card_probe)
+                        except Exception:
+                            card_count = 0
+                        if card_count > 0:
+                            break
+                        # Light progress logging every ~6s
+                        if time.time() - last_log > 6:
+                            elapsed = int(time.time() - (poll_deadline - 35))
+                            print(f"    waiting for card... ({elapsed}s)")
+                            last_log = time.time()
+                        time.sleep(1.5)
+                    if card_count > 0:
+                        print(f"  ✓ product card detected ({card_count} link(s)) "
+                              f"on {tag}")
+                        break
+                    if attempt < MAX_INCHAT_RETRIES:
+                        print(f"  ✗ no product card on {tag} after 35s poll "
+                              f"— reprompting in chat...")
+                        time.sleep(2)
+                    else:
+                        print(f"  ✗ no product card after {attempt} attempts "
+                              f"— Gemini returned text-only, proceeding "
+                              f"without click.")
 
-            # First screenshot: AI Mode result (last attempt's state),
-            # before any click.
+            # First screenshot: AI Mode result as it loads, before click.
             print(f"Taking initial screenshot -> {initial_path.name}...")
             page.screenshot(path=str(initial_path), full_page=True)
 
@@ -1736,7 +1605,7 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
             time.sleep(10)
 
             print("Looking for first product entry link...")
-            if find_first_product_link(page, product_title=product_title):
+            if find_first_product_link(page):
                 print("Clicked. Waiting for product panel...")
                 time.sleep(10)
 
@@ -1812,18 +1681,57 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
                       return total;
                     }
                 """
+                # Multi-round scroll + expand. After the first expand_js
+                # forces overflow:visible, subsequent rounds find no
+                # more "hidden" content via the scrollHeight delta —
+                # but the panel still has lazy-loaded sections (more
+                # retailers, reviews, "What people are saying") that
+                # only render once you actually scroll near them. So
+                # we keep scrolling even when expand_js reports 0px,
+                # and only bail when the document scrollHeight stops
+                # growing across 2 consecutive rounds.
                 total_expanded = 0
-                for round_n in range(4):
-                    print(f"  round {round_n + 1}: scrolling...")
+                prev_doc_h = -1
+                stable_streak = 0
+                MAX_ROUNDS = 8
+                for round_n in range(MAX_ROUNDS):
+                    print(f"  round {round_n + 1}/{MAX_ROUNDS}: scrolling...")
                     page.evaluate(scroll_js)
                     time.sleep(2)
+                    # Also bump main document scroll to bottom in case
+                    # lazy loaders watch document scroll instead of the
+                    # panel's internal scroll.
+                    try:
+                        page.evaluate(
+                            "window.scrollTo({top: document.body.scrollHeight});"
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(1)
                     expanded = page.evaluate(expand_js)
                     total_expanded += expanded
-                    print(f"    expanded {expanded}px this round")
-                    if expanded < 100:
+                    try:
+                        cur_doc_h = page.evaluate(
+                            "document.documentElement.scrollHeight"
+                        )
+                    except Exception:
+                        cur_doc_h = prev_doc_h
+                    grew = cur_doc_h - prev_doc_h if prev_doc_h > 0 else 0
+                    print(f"    expanded {expanded}px, doc={cur_doc_h}px "
+                          f"(grew {grew}px)")
+                    if cur_doc_h == prev_doc_h:
+                        stable_streak += 1
+                    else:
+                        stable_streak = 0
+                    prev_doc_h = cur_doc_h
+                    # Bail once doc height has stopped growing for 2
+                    # consecutive rounds AND expand_js found nothing.
+                    if stable_streak >= 2 and expanded < 100:
+                        print(f"  doc height stable + no expansion — done")
                         break
                     time.sleep(1)
-                print(f"  total expanded: {total_expanded}px")
+                print(f"  total expanded: {total_expanded}px, "
+                      f"final doc height: {prev_doc_h}px")
                 time.sleep(2)
 
             else:
@@ -1860,31 +1768,6 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
                                 f'cls="{L["cls"]}"  href={L["href"]}\n')
                         f.write(f'      text="{L["text"]}"\n')
                 print(f'  → dumped link candidates to {debug_path}')
-
-            # Detect if a product-viewer dialog is currently open. If
-            # so, the dialog's content already contains the full retailer
-            # list and we must NOT run the broad expand/click-outside
-            # operations below — they can dismiss the modal.
-            dialog_open = page.evaluate(r"""
-                () => {
-                  const dlg = document.querySelector(
-                    'dialog[open], [role="dialog"]:not([aria-hidden="true"])'
-                  );
-                  if (dlg) {
-                    const r = dlg.getBoundingClientRect();
-                    return r.width > 100 && r.height > 100;
-                  }
-                  // Also check for Google's product-viewer-dialog wrapper.
-                  return !!document.querySelector(
-                    '[jscontroller*="ProductViewerDialog"], '
-                    + '[data-attrid*="product_viewer"], '
-                    + '#pvdialog, .pvdialog'
-                  );
-                }
-            """)
-            if dialog_open:
-                print("  product viewer dialog detected — skipping "
-                      "broad expand/click-outside steps")
 
             # The right product-detail panel uses an internal scroll
             # container (`div.iQYbye` etc.) — only ~2 of its 5+ retailer
@@ -1931,134 +1814,19 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
             print(f"  expanded {expanded}px of hidden scroll content")
             time.sleep(2)
 
-            # Skip the broad "click More stores" pass when a dialog is
-            # open — those clicks land on buttons anywhere on the page
-            # and can hit the modal backdrop / outside the dialog, which
-            # closes the product viewer.
-            if dialog_open:
-                # Don't click anything when the dialog is open — clicks
-                # can land outside the modal and dismiss it. Just expand
-                # the viewport vertically so the full-height dialog
-                # renders more of its content per screenshot.
-                print("Skipping 'More stores' clicks — dialog is open.")
-                try:
-                    cdp = page.context.new_cdp_session(page)
-                    cdp.send("Emulation.setDeviceMetricsOverride", {
-                        "width": 1728,
-                        "height": 2400,
-                        "deviceScaleFactor": 3,
-                        "mobile": False,
-                    })
-                    time.sleep(1)
-                    print("  expanded viewport to 1728x2400 for dialog snapshot")
-                except Exception as e:
-                    print(f"  could not expand viewport ({e})",
-                          file=sys.stderr)
-            else:
-                # Click "More stores" / "Show all" / "See more" buttons to
-                # reveal hidden retailer rows in the product panel. Google
-                # collapses long retailer lists behind these expanders; if
-                # we don't click them the screenshot only shows the first
-                # few stores. Click up to 5 rounds — each click can render
-                # more "More" buttons (e.g. nested expanders).
-                print("Clicking 'More stores' / expand buttons...")
-                total_clicks = 0
-                for round_n in range(5):
-                    clicks = page.evaluate(r"""
-                        () => {
-                          let n = 0;
-                          const seen = new WeakSet();
-                          const re = /^(more stores|show all|see more|show more|view all|more results|load more|more offers)\b/i;
-                          document.querySelectorAll(
-                            'button, a, [role="button"], div[role="button"]'
-                          ).forEach(el => {
-                            if (seen.has(el)) return;
-                            const t = (el.textContent || '').trim();
-                            if (!re.test(t) || t.length > 40) return;
-                            const r = el.getBoundingClientRect();
-                            if (r.width < 20 || r.height < 10) return;
-                            seen.add(el);
-                            try { el.click(); n++; } catch (e) {}
-                          });
-                          return n;
-                        }
-                    """)
-                    if clicks == 0:
-                        break
-                    total_clicks += clicks
-                    print(f"  round {round_n + 1}: clicked {clicks} expand button(s)")
-                    time.sleep(1.5)
-                print(f"  total expand clicks: {total_clicks}")
-                # Re-run the panel expansion after clicks to absorb any new
-                # scrollable content surfaced by the expanders.
-                page.evaluate("""
-                    () => {
-                      document.querySelectorAll('*').forEach(el => {
-                        const s = getComputedStyle(el);
-                        const oy = s.overflowY;
-                        if (oy !== 'auto' && oy !== 'scroll' && oy !== 'hidden') return;
-                        if (el.scrollHeight - el.clientHeight < 50) return;
-                        el.style.setProperty('max-height', 'none', 'important');
-                        el.style.setProperty('height', 'auto', 'important');
-                        el.style.setProperty('overflow-y', 'visible', 'important');
-                        el.style.setProperty('overflow', 'visible', 'important');
-                      });
-                    }
-                """)
-                time.sleep(1)
-
             if zoom < 1.0:
                 print(f"Applying page zoom {zoom}...")
                 page.evaluate(f"document.body.style.zoom = '{zoom}'")
                 time.sleep(2)
 
-            # Hide Google AI Mode's "Ask anything" composer / prompt bar
-            # so it doesn't sit awkwardly in the middle of a full-page
-            # screenshot when the right product panel runs longer than
-            # the left chat column. Same approach as ChatGPT.
-            try:
-                page.evaluate(r"""
-                    () => {
-                      const ta = document.querySelector(
-                        'textarea[placeholder*="Ask anything" i], '
-                        + 'textarea[aria-label*="ask" i]'
-                      );
-                      if (!ta) return;
-                      let el = ta.parentElement;
-                      while (el && el !== document.body) {
-                        const cs = getComputedStyle(el);
-                        if (cs.position === 'fixed' || cs.position === 'sticky') {
-                          el.style.setProperty('display', 'none', 'important');
-                          return;
-                        }
-                        el = el.parentElement;
-                      }
-                      const form = ta.closest('form');
-                      if (form) form.style.setProperty('display', 'none', 'important');
-                    }
-                """)
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"  could not hide composer ({e})", file=sys.stderr)
-
             print("Taking full-page screenshot...")
-            page.screenshot(path=str(screenshot_path), full_page=True,
-                            timeout=120000)
-            try:
-                _trim_dark_bottom(screenshot_path)
-            except Exception as e:
-                print(f"  bottom trim skipped ({e})", file=sys.stderr)
+            page.screenshot(path=str(screenshot_path), full_page=True)
         finally:
-            try:
-                if len(ctx.pages) > 1:
-                    page.close()
-            except Exception:
-                pass
+            # Don't close the page — it might be the only one and closing
+            # the last tab terminates the browser. Just disconnect.
             browser.close()
 
     return screenshot_path
-
-
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Capture + crop a Google AI Mode result for a product.",

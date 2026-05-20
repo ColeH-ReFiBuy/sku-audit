@@ -44,6 +44,12 @@ SKU="$3"
 WALMART_URL="${4:-}"
 PPTX="${5:-/Users/colesonharvey/Library/CloudStorage/OneDrive-ReFiBuy,Inc/ClaudeMattel.pptx}"
 
+# If the user passed just a filename (no /), assume it's in the OneDrive
+# audit folder. Avoids the "ERROR: pptx not found" footgun on the paste step.
+if [[ "$PPTX" != */* ]]; then
+  PPTX="/Users/colesonharvey/Library/CloudStorage/OneDrive-ReFiBuy,Inc/$PPTX"
+fi
+
 echo "=== SKU audit: $SKU ==="
 echo "Product 1 (Google + ChatGPT): $P1"
 echo "Product 2 (Alexa):            $P2"
