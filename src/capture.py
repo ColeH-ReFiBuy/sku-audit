@@ -23,6 +23,7 @@ First-time setup:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import socket
 import subprocess
@@ -571,7 +572,26 @@ def capture_chatgpt(product_title: str, sku: str,
 
             print("Taking initial ChatGPT screenshot...")
             initial_chatgpt = screenshot_path.with_name("chatgpt_initial.png")
-            page.screenshot(path=str(initial_chatgpt), full_page=True)
+            # Use raw CDP — Playwright's full_page=True hangs/produces
+            # partial output on heavy ChatGPT pages.
+            try:
+                cdp = page.context.new_cdp_session(page)
+                doc_h = page.evaluate("document.documentElement.scrollHeight")
+                vw = page.evaluate("window.innerWidth")
+                import base64
+                result = cdp.send("Page.captureScreenshot", {
+                    "format": "png",
+                    "captureBeyondViewport": True,
+                    "clip": {"x": 0, "y": 0, "width": vw,
+                             "height": min(doc_h, 12000), "scale": 1},
+                })
+                initial_chatgpt.write_bytes(base64.b64decode(result["data"]))
+                cdp.detach()
+            except Exception as _ie:
+                print(f"  CDP screenshot failed ({_ie}) — Playwright fallback",
+                      file=sys.stderr)
+                page.screenshot(path=str(initial_chatgpt), full_page=True,
+                                timeout=120000)
 
             # Click the first product card in the response so its detail panel
             # opens, matching the Google flow.
@@ -696,15 +716,63 @@ def capture_chatgpt(product_title: str, sku: str,
                 print(f"  could not hide composer ({e})", file=sys.stderr)
 
             print("Taking screenshot...")
-            # Bump timeout — fully expanded ChatGPT side panel can produce
-            # a screenshot tall enough to exceed the 30s default.
-            page.screenshot(path=str(screenshot_path), full_page=True,
-                            timeout=120000)
+            # Use raw CDP — Playwright's full_page=True hangs / produces
+            # partial output on heavy ChatGPT pages. Compute capture
+            # height as the MAX of doc scrollHeight + side-panel bottom
+            # so the position:fixed product-detail panel isn't clipped.
+            try:
+                cdp = page.context.new_cdp_session(page)
+                dims = page.evaluate("""
+                    () => {
+                      const docH = document.documentElement.scrollHeight;
+                      const vw = window.innerWidth;
+                      // Find the max bottom of any element that has
+                      // substantial visible content (excludes giant
+                      // empty/dark wrappers).
+                      let maxBottom = docH;
+                      // Specifically check the product-detail side panel:
+                      // ChatGPT puts it inside [data-testid="products-widget"]
+                      // or a section to the right of the chat column.
+                      const candidates = document.querySelectorAll(
+                        '[data-testid*="product"], '
+                        + '[data-testid*="conversation-turn"], '
+                        + 'aside, section, main'
+                      );
+                      for (const el of candidates) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 100 || r.height < 50) continue;
+                        // Only count if it has meaningful descendants
+                        // (img, text length, button)
+                        const hasContent = el.querySelector(
+                          'img, h1, h2, h3, button, [role="button"]'
+                        );
+                        if (!hasContent) continue;
+                        const bottom = r.bottom + window.scrollY;
+                        if (bottom > maxBottom) maxBottom = bottom;
+                      }
+                      return {
+                        vw, docH, maxBottom: Math.round(maxBottom)
+                      };
+                    }
+                """)
+                height = min(max(dims["maxBottom"], dims["docH"]) + 40, 16000)
+                import base64
+                result = cdp.send("Page.captureScreenshot", {
+                    "format": "png",
+                    "captureBeyondViewport": True,
+                    "clip": {"x": 0, "y": 0, "width": dims["vw"],
+                             "height": height, "scale": 1},
+                })
+                screenshot_path.write_bytes(base64.b64decode(result["data"]))
+                cdp.detach()
+                print(f"  captured {dims['vw']}x{height} "
+                      f"(doc={dims['docH']}, panel-bottom={dims['maxBottom']})")
+            except Exception as _se:
+                print(f"  CDP screenshot failed ({_se}) — Playwright fallback",
+                      file=sys.stderr)
+                page.screenshot(path=str(screenshot_path), full_page=True,
+                                timeout=120000)
             # Trim solid dark rows at the bottom of the screenshot.
-            # ChatGPT's side panel often runs taller than the chat
-            # column, leaving the lower half of the full-page capture
-            # as an empty dark expanse. Crop it off so the saved
-            # image stops where actual content ends.
             try:
                 _trim_dark_bottom(screenshot_path)
             except Exception as e:
@@ -1102,9 +1170,41 @@ def capture_alexa(product_title: str, sku: str,
 
             # 7c. Scroll to the "Looking for specific info?" Q&A pill
             # block (further down the page, near Top Brand / related
-            # carousel). Match the smallest element whose direct text
-            # starts with the phrase, so we hit the heading itself
-            # rather than a huge ancestor container.
+            # carousel).
+            #
+            # Amazon's PDP is heavily lazy-loaded: sections below the
+            # fold don't render until you actually scroll past them.
+            # If we teleport directly to y=5000+ with window.scrollTo,
+            # the Q&A section is still empty/skeleton and the
+            # screenshot comes out blank-white. Fix: walk down the
+            # page incrementally first (waking up every lazy section
+            # on the way), then jump to the target heading.
+            print("Pre-scrolling page to trigger lazy-load...")
+            try:
+                doc_h = page.evaluate("document.documentElement.scrollHeight")
+            except Exception:
+                doc_h = 0
+            step = 600
+            y = 0
+            while y < doc_h:
+                try:
+                    page.evaluate(f"window.scrollTo(0, {y})")
+                except Exception:
+                    break
+                time.sleep(0.25)
+                y += step
+            # One more pass at the very bottom to be sure
+            try:
+                page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+            except Exception:
+                pass
+            time.sleep(2)
+
+            # Best-effort Q&A pill section snap. Match the heading
+            # text, scroll there, snap. Some PDPs render the section,
+            # some don't — when the snap is sparse the user can grab
+            # it manually from the live Amazon tab (which we leave open
+            # after capture).
             print("Locating 'Looking for specific info?' Q&A section...")
             scrolled = page.evaluate("""
                 () => {
@@ -1130,7 +1230,7 @@ def capture_alexa(product_title: str, sku: str,
             """)
             if scrolled >= 0:
                 print(f"  scrolled to y={scrolled}")
-                time.sleep(2)
+                time.sleep(3)
                 print(f"Taking Q&A snap -> {qa_path.name}")
                 page.screenshot(path=str(qa_path), full_page=False)
                 saved.append(qa_path)
@@ -1138,6 +1238,18 @@ def capture_alexa(product_title: str, sku: str,
                 print("  'Looking for specific info?' Q&A section not "
                       "found on this PDP — skipping Q&A snap",
                       file=sys.stderr)
+                try:
+                    if qa_path.exists():
+                        qa_path.unlink()
+                        print(f"  removed stale {qa_path.name}")
+                except Exception:
+                    pass
+
+            # Quick-test shortcut: set ALEXA_PILLS_ONLY=1 to stop here
+            # after the three pill snaps without sending Alexa prompts.
+            if os.environ.get("ALEXA_PILLS_ONLY") == "1":
+                print("ALEXA_PILLS_ONLY set — stopping before prompt sends.")
+                return saved
 
             # 7d. Send two follow-up prompts via the panel textarea and
             # screenshot each response. Both prompts reference "this
@@ -1594,9 +1706,32 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
                               f"— Gemini returned text-only, proceeding "
                               f"without click.")
 
-            # First screenshot: AI Mode result as it loads, before click.
+            # First screenshot: full document from y=0 via raw CDP
+            # (Playwright's full_page=True hangs on AI Mode pages).
             print(f"Taking initial screenshot -> {initial_path.name}...")
-            page.screenshot(path=str(initial_path), full_page=True)
+            try:
+                dims = page.evaluate("""
+                    () => ({
+                      vw: window.innerWidth,
+                      docH: document.documentElement.scrollHeight,
+                    })
+                """)
+                cdp = page.context.new_cdp_session(page)
+                import base64
+                result = cdp.send("Page.captureScreenshot", {
+                    "format": "png", "captureBeyondViewport": True,
+                    "clip": {"x": 0, "y": 0,
+                             "width": dims["vw"],
+                             "height": min(dims["docH"], 16000),
+                             "scale": 1},
+                })
+                initial_path.write_bytes(base64.b64decode(result["data"]))
+                cdp.detach()
+            except Exception as _ie:
+                print(f"  CDP screenshot failed ({_ie}) — Playwright fallback",
+                      file=sys.stderr)
+                page.screenshot(path=str(initial_path),
+                                full_page=False, timeout=60000)
 
             # Extra dwell — gives Google extra time to finish populating
             # retailer cards in the panel state. Skipping this often results
@@ -1819,8 +1954,78 @@ def capture(product_title: str, sku: str, profile_dir: Path = DEFAULT_PROFILE,
                 page.evaluate(f"document.body.style.zoom = '{zoom}'")
                 time.sleep(2)
 
-            print("Taking full-page screenshot...")
-            page.screenshot(path=str(screenshot_path), full_page=True)
+            # Full document capture via raw CDP. Captures from y=0
+            # down to the max of doc scrollHeight + right-side product
+            # panel bottom so the panel isn't clipped even when it has
+            # `position: fixed`/internal-scroll content that doesn't
+            # extend the document scrollHeight.
+            print("Taking screenshot (full document + panel)...")
+            try:
+                dims = page.evaluate("""
+                    () => {
+                      const docH = document.documentElement.scrollHeight;
+                      const vw = window.innerWidth;
+                      // Find max bottom of any element with image+text
+                      // content — covers right-side product detail
+                      // panel that uses position:fixed/sticky and
+                      // doesn't push the doc scrollHeight up.
+                      let maxBottom = docH;
+                      const cands = document.querySelectorAll(
+                        '[class*="iQYbye"], [class*="PG8i1e"], '
+                        + 'aside, section, main, '
+                        + '[role="complementary"], [role="dialog"]'
+                      );
+                      for (const el of cands) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 100 || r.height < 50) continue;
+                        const hasContent = el.querySelector(
+                          'img, h1, h2, h3, button, [role="button"]'
+                        );
+                        if (!hasContent) continue;
+                        const bottom = r.bottom + window.scrollY;
+                        if (bottom > maxBottom) maxBottom = bottom;
+                      }
+                      return {vw, docH, maxBottom: Math.round(maxBottom)};
+                    }
+                """)
+                height = max(dims["maxBottom"], dims["docH"]) + 40
+                # At 3x DSF, Chrome's screenshot buffer can't render
+                # captures taller than ~12000 actual px (4000 CSS px).
+                # The right-side panel often has 5000-8000 CSS px of
+                # content. Drop the device scale factor to 1 for the
+                # screenshot so the actual pixel count fits, then
+                # restore 3x DSF afterward.
+                print(f"  target capture {dims['vw']}x{height} "
+                      f"(doc={dims['docH']}, panel-bottom={dims['maxBottom']})")
+                cdp = page.context.new_cdp_session(page)
+                # Save current DSF, set to 1 for the capture.
+                cdp.send("Emulation.setDeviceMetricsOverride", {
+                    "width": dims["vw"], "height": min(height, 12000),
+                    "deviceScaleFactor": 1, "mobile": False,
+                })
+                time.sleep(0.5)
+                import base64
+                result = cdp.send("Page.captureScreenshot", {
+                    "format": "png", "captureBeyondViewport": True,
+                    "clip": {
+                        "x": 0, "y": 0,
+                        "width": dims["vw"],
+                        "height": min(height, 12000),
+                        "scale": 1,
+                    },
+                })
+                screenshot_path.write_bytes(base64.b64decode(result["data"]))
+                # Restore 3x DSF.
+                cdp.send("Emulation.setDeviceMetricsOverride", {
+                    "width": 1728, "height": 912,
+                    "deviceScaleFactor": 3, "mobile": False,
+                })
+                cdp.detach()
+            except Exception as e:
+                print(f"  CDP screenshot failed ({e}) — Playwright fallback",
+                      file=sys.stderr)
+                page.screenshot(path=str(screenshot_path),
+                                full_page=False, timeout=60000)
         finally:
             # Don't close the page — it might be the only one and closing
             # the last tab terminates the browser. Just disconnect.
