@@ -298,36 +298,48 @@ def capture_chatgpt(product_title: str, sku: str,
                     () => {
                       const docH = document.documentElement.scrollHeight;
                       const vw = window.innerWidth;
-                      // Find the max bottom of any element that has
-                      // substantial visible content (excludes giant
-                      // empty/dark wrappers).
-                      let maxBottom = docH;
-                      // Specifically check the product-detail side panel:
-                      // ChatGPT puts it inside [data-testid="products-widget"]
-                      // or a section to the right of the chat column.
-                      const candidates = document.querySelectorAll(
-                        '[data-testid*="product"], '
-                        + '[data-testid*="conversation-turn"], '
-                        + 'aside, section, main'
-                      );
-                      for (const el of candidates) {
+                      // Find the bottom of the LOWEST element that
+                      // contains actual rendered content. Previously
+                      // we used container <aside>/<section> bottoms,
+                      // which include trailing padding/empty area
+                      // (e.g. ChatGPT's product-detail panel has
+                      // ~600px of empty space below the last retailer
+                      // offer, producing a black strip in the snap).
+                      // Walk all leaf-ish elements and find the
+                      // lowest one with visible text or an image.
+                      let contentBottom = 0;
+                      const seen = new WeakSet();
+                      for (const el of document.querySelectorAll(
+                          'img, [role="img"], h1, h2, h3, h4, p, span, '
+                          + 'a, button, li, td')) {
+                        if (seen.has(el)) continue;
+                        seen.add(el);
                         const r = el.getBoundingClientRect();
-                        if (r.width < 100 || r.height < 50) continue;
-                        // Only count if it has meaningful descendants
-                        // (img, text length, button)
-                        const hasContent = el.querySelector(
-                          'img, h1, h2, h3, button, [role="button"]'
-                        );
-                        if (!hasContent) continue;
+                        if (r.width < 10 || r.height < 8) continue;
+                        const cs = getComputedStyle(el);
+                        if (cs.display === 'none') continue;
+                        if (cs.visibility === 'hidden') continue;
+                        if (parseFloat(cs.opacity) === 0) continue;
+                        // Element must have actual rendered content:
+                        // either text (textContent length) or be an
+                        // image (img/svg/role=img).
+                        const tag = el.tagName.toLowerCase();
+                        const isImage = (tag === 'img' || tag === 'svg' ||
+                                         el.getAttribute('role') === 'img');
+                        const txt = (el.textContent || '').trim();
+                        if (!isImage && txt.length < 2) continue;
                         const bottom = r.bottom + window.scrollY;
-                        if (bottom > maxBottom) maxBottom = bottom;
+                        if (bottom > contentBottom) contentBottom = bottom;
                       }
-                      return {
-                        vw, docH, maxBottom: Math.round(maxBottom)
-                      };
+                      return {vw, docH,
+                              contentBottom: Math.round(contentBottom)};
                     }
                 """)
-                height = min(max(dims["maxBottom"], dims["docH"]) + 40, 16000)
+                # Use the lowest actual-content element's bottom + small
+                # buffer. Don't include docH if it's larger — that's
+                # often trailing empty space.
+                content_bottom = dims["contentBottom"] or dims["docH"]
+                height = min(content_bottom + 40, 16000)
                 import base64
                 result = cdp.send("Page.captureScreenshot", {
                     "format": "png",
@@ -338,7 +350,8 @@ def capture_chatgpt(product_title: str, sku: str,
                 screenshot_path.write_bytes(base64.b64decode(result["data"]))
                 cdp.detach()
                 print(f"  captured {dims['vw']}x{height} "
-                      f"(doc={dims['docH']}, panel-bottom={dims['maxBottom']})")
+                      f"(doc={dims['docH']}, "
+                      f"content-bottom={dims['contentBottom']})")
             except Exception as _se:
                 print(f"  CDP screenshot failed ({_se}) — Playwright fallback",
                       file=sys.stderr)
